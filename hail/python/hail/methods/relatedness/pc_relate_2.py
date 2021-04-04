@@ -328,73 +328,52 @@ def pc_relate_2(call_expr, min_individual_maf, *, k=None, scores_expr=None,
     g_bm = BlockMatrix.from_entry_expr(mean_imputed_gt,
                                        block_size=block_size)
 
-    pcs = scores_table.collect(_localize=False).map(lambda x: x.__scores)
+    pcs = hl.nd.array(
+            scores_table.collect(_localize=False).map(lambda x: x.__scores)
+    )
 
     # Concat array of ones (intercept) with PCs, do QR
-    pcs_nd = hl.nd.array(pcs)
-    v_nd = hl.nd.concatenate([hl.nd.ones((pcs_nd.shape[0], 1)), pcs_nd], axis=1)
-    q_nd, r_nd = hl.nd.qr(v_nd, mode='reduced')
-    rinv_qt_nd = hl.nd.inv(r_nd) @ q_nd.T
+    v = hl.nd.concatenate([hl.nd.ones((pcs.shape[0], 1)), pcs], axis=1)
+    q, r = hl.nd.qr(v, mode='reduced')
+    rinv_qt = hl.nd.inv(r) @ q.T
 
     # Convert inv(r) @ q.T to bm for computing beta
-    rinv_qt_bm = BlockMatrix.from_numpy(hl.eval(rinv_qt_nd))
+    rinv_qt_bm = BlockMatrix.from_numpy(hl.eval(rinv_qt))
     beta_bm = rinv_qt_bm @ g_bm.T
 
     # Convert v to bm for computing mu
-    v_bm = BlockMatrix.from_numpy(hl.eval(v_nd))
+    v_bm = BlockMatrix.from_numpy(hl.eval(v))
     mu_bm = 0.5 * (v_bm @ beta_bm).T
-
-    # Convert g, mu BMs to MTs to clean up entries
-    g_mt = g_bm.to_matrix_table_row_major()
-    pre_mu_mt = mu_bm.to_matrix_table_row_major()
 
     # Define NaN to use instead of missing values, o/w can't convert back to BM
     nan = hl.literal(0) / 0
 
-    # Replace bad entries in g, mu matrix with NaNs
-    g_mt = g_mt.annotate_entries(g=hl.if_else(_bad_gt(g_mt.element),
-                                              nan,
-                                              g_mt.element))
-    g_mt = g_mt.select_entries(g_mt.g)
+    # Convert g and mu to MTs to replace bad entries with NaN
+    g_mt = g_bm.to_matrix_table_row_major()
+    g_mt = g_mt.annotate_entries(g=hl.if_else(_bad_gt(g_mt.element), nan, g_mt.element))
+    pre_mu_mt = mu_bm.to_matrix_table_row_major()
     pre_mu_mt = pre_mu_mt.annotate_entries(pre_mu=hl.if_else(_bad_mu(pre_mu_mt.element, min_individual_maf),
                                                              nan,
                                                              pre_mu_mt.element))
-    pre_mu_mt = pre_mu_mt.select_entries(pre_mu_mt.pre_mu)
 
-    # Combine entries from g and pre_mu matrices into single MT
-    g_pre_mu_mt = g_mt.annotate_entries(pre_mu=pre_mu_mt[g_mt.row_idx,
-                                                         g_mt.col_idx].pre_mu)
+    # Use bm_mt to store entries for g, pre_mu, mu, var, and centered_af
+    bm_mt = g_mt.annotate_entries(pre_mu=pre_mu_mt[g_mt.row_idx, g_mt.col_idx].pre_mu)
+    bm_mt = bm_mt.annotate_entries(mu=hl.if_else(hl.is_nan(bm_mt.g) | hl.is_nan(bm_mt.pre_mu),
+                                                 nan,
+                                                 bm_mt.pre_mu))
+    bm_mt = bm_mt.annotate_entries(variance=hl.if_else(hl.is_nan(bm_mt.mu),
+                                                       hl.float64(0.0),
+                                                       (bm_mt.mu * (1.0 - bm_mt.mu))),
+                                   centered_af=hl.if_else(hl.is_nan(bm_mt.mu),
+                                                          hl.float64(0.0),
+                                                          (bm_mt.g / 2) - bm_mt.mu))
 
-    # Create final mu matrix
-    # If either pre_mu or g entry in combined MT is NaN, insert NaN, otherwise use pre_mu entry
-    # To make sure we can compute centered AF, (g/2) - mu
-    mu_mt = g_pre_mu_mt.annotate_entries(mu=hl.if_else(hl.is_nan(g_pre_mu_mt.g) | hl.is_nan(g_pre_mu_mt.pre_mu),
-                                                       nan,
-                                                       g_pre_mu_mt.pre_mu))
-    mu_mt = mu_mt.select_entries(mu_mt.mu)
-
-    # Create variance matrix based on mu matrix, replacing NaNs with zeros
-    variance_mt = mu_mt.annotate_entries(variance=hl.if_else(hl.is_nan(mu_mt.mu),
-                                                             hl.float(0.0),
-                                                             (mu_mt.mu * (1.0 - mu_mt.mu))))
-    variance_mt = variance_mt.select_entries(variance_mt.variance)
-
-    # Combine entries from g and mu matrices into single MT, for computing centered AF
-    g_mu_mt = g_mt.annotate_entries(mu=mu_mt[g_mt.row_idx,
-                                             g_mt.col_idx].mu)
-
-    # Create matrix of centered AFs as entries
-    centered_af_mt = g_mu_mt.annotate_entries(centered_af=hl.if_else(hl.is_nan(g_mu_mt.mu),
-                                                                     hl.float64(0.0),
-                                                                     (g_mu_mt.g / 2) - g_mu_mt.mu))
-    centered_af_mt = centered_af_mt.select_entries(centered_af_mt.centered_af)
-
-    # Convert MTs back to BlockMatrix
-    g_bm = BlockMatrix.from_entry_expr(g_mt.g)
-    mu_bm = BlockMatrix.from_entry_expr(mu_mt.mu)
-    variance_bm = BlockMatrix.from_entry_expr(variance_mt.variance)
+    # Convert MT entries back to BlockMatrix
+    g_bm = BlockMatrix.from_entry_expr(bm_mt.g)
+    mu_bm = BlockMatrix.from_entry_expr(bm_mt.mu)
+    variance_bm = BlockMatrix.from_entry_expr(bm_mt.variance)
     std_dev_bm = variance_bm.sqrt()
-    centered_af_bm = BlockMatrix.from_entry_expr(centered_af_mt.centered_af)
+    centered_af_bm = BlockMatrix.from_entry_expr(bm_mt.centered_af)
 
     phi_bm = _gram(centered_af_bm) / _gram(std_dev_bm)
     ht = phi_bm.entries().rename({'entry': 'kin'})
