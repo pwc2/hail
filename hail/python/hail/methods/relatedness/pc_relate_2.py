@@ -14,11 +14,16 @@ def _bad_mu(mu, maf):
 
 
 def _bad_gt(gt):
-    return (gt != hl.float64(0)) & (gt != hl.float64(1)) & (gt != hl.float64(2))
+    return (gt != 0.0) & (gt != 1.0) & (gt != 2.0)
 
 
 def _gram(M):
     return M.T @ M
+
+
+def _AtB_plus_BtA(A, B):
+    temp = (A.T @ B).persist()
+    return temp + temp.T
 
 
 @typecheck(call_expr=expr_call,
@@ -150,7 +155,7 @@ def pc_relate_2(call_expr, min_individual_maf, *, k=None, scores_expr=None,
           \end{cases}
 
         \qquad
-        X_{is} \coloneqq g^D_{is} - \widehat{\sigma^2_{is}} (1 - \widehat{f_i})
+        X_{is} \coloneqq g^D_{is} - \widehat{\sigma^2_{is}} (1 + \widehat{f_i})
 
     The estimator for kinship is given by:
 
@@ -299,6 +304,9 @@ def pc_relate_2(call_expr, min_individual_maf, *, k=None, scores_expr=None,
     :class:`.Table`
         A :class:`.Table` mapping pairs of samples to their pair-wise statistics.
     """
+    assert (min_individual_maf >= 0.0 and min_individual_maf <= 1.0), \
+        f"invalid argument: min_individual_maf={min_individual_maf}. " \
+        f"Must have min_individual_maf on interval [0.0, 1.0]."
     mt = matrix_table_source('pc_relate_2/call_expr', call_expr)
 
     if k and scores_expr is None:
@@ -325,65 +333,125 @@ def pc_relate_2(call_expr, min_individual_maf, *, k=None, scores_expr=None,
     if not block_size:
         block_size = BlockMatrix.default_block_size()
 
-    g_bm = BlockMatrix.from_entry_expr(mean_imputed_gt,
-                                       block_size=block_size)
+    g_bm = BlockMatrix.from_entry_expr(mean_imputed_gt, block_size=block_size).persist()
 
-    pcs = hl.nd.array(
-            scores_table.collect(_localize=False).map(lambda x: x.__scores)
-    )
+    pcs = hl.nd.array(scores_table.collect(_localize=False).map(lambda x: x.__scores))
 
     # Concat array of ones (intercept) with PCs, do QR
-    v = hl.nd.concatenate([hl.nd.ones((pcs.shape[0], 1)), pcs], axis=1)
+    v = hl.nd.concatenate([hl.nd.ones((pcs.shape[0], 1)), pcs], axis=1)._persist()
     q, r = hl.nd.qr(v, mode='reduced')
-    rinv_qt = hl.nd.inv(r) @ q.T
 
-    # Convert inv(r) @ q.T to bm for computing beta
-    rinv_qt_bm = BlockMatrix.from_numpy(hl.eval(rinv_qt))
-    beta_bm = rinv_qt_bm @ g_bm.T
+    # Compute beta and mu
+    rinv_qt_bm = BlockMatrix.from_numpy(hl.eval(hl.nd.inv(r) @ q.T), block_size=block_size).persist()
+    beta_bm = (rinv_qt_bm @ g_bm.T).persist()
+    v_bm = BlockMatrix.from_numpy(hl.eval(v), block_size=block_size)
+    mu_bm = (0.5 * (v_bm @ beta_bm).T)
 
-    # Convert v to bm for computing mu
-    v_bm = BlockMatrix.from_numpy(hl.eval(v))
-    mu_bm = 0.5 * (v_bm @ beta_bm).T
-
-    # Define NaN to use instead of missing values, o/w can't convert back to BM
+    # Define NaN to use instead of missing, otherwise cannot go back to block matrix
     nan = hl.literal(0) / 0
 
-    # Convert g and mu to MTs to replace bad entries with NaN
+    # Replace invalid values for g and mu w/ NaN
     g_mt = g_bm.to_matrix_table_row_major()
-    g_mt = g_mt.annotate_entries(g=hl.if_else(_bad_gt(g_mt.element), nan, g_mt.element))
+    g_mt = g_mt.annotate_entries(g=hl.if_else(_bad_gt(g_mt.element),
+                                              nan,
+                                              g_mt.element)).drop("element")
     pre_mu_mt = mu_bm.to_matrix_table_row_major()
     pre_mu_mt = pre_mu_mt.annotate_entries(pre_mu=hl.if_else(_bad_mu(pre_mu_mt.element, min_individual_maf),
                                                              nan,
-                                                             pre_mu_mt.element))
+                                                             pre_mu_mt.element)).drop("element")
 
-    # Use bm_mt to store entries for g, pre_mu, mu, var, and centered_af
+    # Use bm_mt to store entries for g, pre_mu, mu, mu**2, (1-mu)**2, var, std_dev, and centered_af
     bm_mt = g_mt.annotate_entries(pre_mu=pre_mu_mt[g_mt.row_idx, g_mt.col_idx].pre_mu)
     bm_mt = bm_mt.annotate_entries(mu=hl.if_else(hl.is_nan(bm_mt.g) | hl.is_nan(bm_mt.pre_mu),
                                                  nan,
                                                  bm_mt.pre_mu))
-    bm_mt = bm_mt.annotate_entries(variance=hl.if_else(hl.is_nan(bm_mt.mu),
-                                                       hl.float64(0.0),
+    bm_mt = bm_mt.annotate_entries(mu2=hl.if_else(hl.is_nan(bm_mt.mu),
+                                                  0.0,
+                                                  bm_mt.mu ** 2),
+                                   one_minus_mu2=hl.if_else(hl.is_nan(bm_mt.mu),
+                                                            0.0,
+                                                            (1.0 - bm_mt.mu) ** 2),
+                                   variance=hl.if_else(hl.is_nan(bm_mt.mu),
+                                                       0.0,
                                                        (bm_mt.mu * (1.0 - bm_mt.mu))),
                                    centered_af=hl.if_else(hl.is_nan(bm_mt.mu),
-                                                          hl.float64(0.0),
+                                                          0.0,
                                                           (bm_mt.g / 2) - bm_mt.mu))
+    bm_mt = bm_mt.annotate_entries(std_dev=hl.sqrt(bm_mt.variance))
 
-    # Convert MT entries back to BlockMatrix
-    g_bm = BlockMatrix.from_entry_expr(bm_mt.g)
-    mu_bm = BlockMatrix.from_entry_expr(bm_mt.mu)
-    variance_bm = BlockMatrix.from_entry_expr(bm_mt.variance)
-    std_dev_bm = variance_bm.sqrt()
-    centered_af_bm = BlockMatrix.from_entry_expr(bm_mt.centered_af)
-
-    phi_bm = _gram(centered_af_bm) / _gram(std_dev_bm)
+    # Compute kinship (phi) estimate
+    centered_af_bm = BlockMatrix.from_entry_expr(bm_mt.centered_af, block_size=block_size)
+    std_dev_bm = BlockMatrix.from_entry_expr(bm_mt.std_dev, block_size=block_size)
+    phi_bm = (_gram(centered_af_bm) / _gram(std_dev_bm)).persist()
     ht = phi_bm.entries().rename({'entry': 'kin'})
+    ht = ht.annotate(k0=hl.missing(hl.tfloat64),
+                     k1=hl.missing(hl.tfloat64),
+                     k2=hl.missing(hl.tfloat64))
 
-    # if statistics == 'kin':
-    #     ht = ht.drop('ibd0', 'ibd1', 'ibd2')
-    # elif statistics == 'kin2':
-    #     ht = ht.drop('ibd0', 'ibd1')
-    # elif statistics == 'kin20':
-    #     ht = ht.drop('ibd1')
+    if statistics is "kin2" or "kin20" or "all":
+        # Create table w/ self-kinship (phi_ii) values
+        phi_ii_ht = phi_bm.diagonal().entries().key_by("j").drop("i") \
+            .rename({"j": "idx", "entry": "phi_ii"})
+
+        # Annotate cols of bm_mt w/ self-kinship (phi_ii) and inbreeding coef (f_i)
+        bm_mt = bm_mt.annotate_cols(phi_ii=phi_ii_ht[bm_mt.col_idx].phi_ii,
+                                    f_i=(2.0 * phi_ii_ht[bm_mt.col_idx].phi_ii) - 1.0)
+
+        # Create entries for dominance encoding of genotype matrix (gd and normalized_gd)
+        bm_mt = bm_mt.annotate_entries(gd=hl.case()
+                                       .when(hl.is_nan(bm_mt.mu), 0.0)
+                                       .when(bm_mt.g == 0.0, bm_mt.mu)
+                                       .when(bm_mt.g == 1.0, 0.0)
+                                       .when(bm_mt.g == 2.0, 1 - bm_mt.mu)
+                                       .default(nan))
+        bm_mt = bm_mt.annotate_entries(normalized_gd=bm_mt.gd - bm_mt.variance * (1 + bm_mt.f_i))
+
+        # Compute IBD2 (k2) estimate
+        normalized_gd_bm = BlockMatrix.from_entry_expr(bm_mt.normalized_gd, block_size=block_size)
+        variance_bm = BlockMatrix.from_entry_expr(bm_mt.variance, block_size=block_size)
+        k2_bm = _gram(normalized_gd_bm) / _gram(variance_bm)
+        ht = ht.annotate(k2=k2_bm.entries()[ht.i, ht.j].entry)
+
+        if statistics is "kin20" or "all":
+            # Compute IBS0
+            bm_mt = bm_mt.annotate_entries(hom_alt=hl.if_else((hl.is_nan(bm_mt.mu) | (bm_mt.g != 2.0)),
+                                                              0.0,
+                                                              1.0),
+                                           hom_ref=hl.if_else((hl.is_nan(bm_mt.mu) | (bm_mt.g != 0.0)),
+                                                              0.0,
+                                                              1.0))
+            hom_alt_bm = BlockMatrix.from_entry_expr(bm_mt.hom_alt, block_size=block_size)
+            hom_ref_bm = BlockMatrix.from_entry_expr(bm_mt.hom_ref, block_size=block_size)
+            ibs0_bm = _AtB_plus_BtA(hom_alt_bm, hom_ref_bm)
+
+            _k0_cutoff = 2.0 ** (-5.0 / 2.0)
+
+            # Compute IBD0 (k0) estimates for when phi > _k0_cutoff
+            mu2_bm = BlockMatrix.from_entry_expr(bm_mt.mu2, block_size=block_size)
+            one_minus_mu2_bm = BlockMatrix.from_entry_expr(bm_mt.one_minus_mu2, block_size=block_size)
+            k0_bm = ibs0_bm / _AtB_plus_BtA(mu2_bm, one_minus_mu2_bm)
+            ht = ht.annotate(k0=k0_bm.entries()[ht.i, ht.j].entry)
+
+            # Correct the IBD0 (k0) estimates for when phi <= _k0_cutoff
+            ht = ht.annotate(k0=hl.if_else(ht.kin <= _k0_cutoff,
+                                           (1.0 - (4.0 * ht.kin) + ht.k2),
+                                           ht.k0))
+
+            if statistics is "all":
+                ht = ht.annotate(k1=1 - ht.k2 - ht.k0)
+
+    ht = ht.rename({"k0": "ibd0", "k1": "ibd1", "k2": "ibd2"})
+
+    if min_kinship:
+        ht = ht.filter(ht.kin <= min_kinship, keep=False)
+
+    if statistics is not "all":
+        _fields_to_drop = {
+            "kin": ["ibd0", "ibd1", "ibd2"],
+            "kin2": ["ibd0", "ibd1"],
+            "kin20": ["ibd1"]
+        }
+        ht = ht.drop(*_fields_to_drop[statistics])
 
     if not include_self_kinship:
         ht = ht.filter(ht.i == ht.j, keep=False)
