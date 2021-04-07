@@ -1,7 +1,10 @@
+from typing import Optional
+
 import hail as hl
 import hail.expr.aggregators as agg
-from hail.expr import (analyze, expr_array, expr_call,
-                       expr_float64, matrix_table_source)
+from hail.expr import (ArrayNumericExpression, BooleanExpression,
+                       CallExpression, Float64Expression, analyze, expr_array,
+                       expr_call, expr_float64, matrix_table_source)
 from hail.linalg import BlockMatrix
 from hail.table import Table
 from hail.typecheck import enumeration, nullable, numeric, typecheck
@@ -9,19 +12,69 @@ from hail.typecheck import enumeration, nullable, numeric, typecheck
 from ..pca import hwe_normalized_pca
 
 
-def _bad_mu(mu, maf):
+def _bad_mu(mu: Float64Expression, maf: float) -> BooleanExpression:
+    """Check if computed value for estimated individual-specific allele
+    frequency (mu) is not valid for estimating relatedness.
+
+    Parameters
+    ----------
+    mu : :class:`.Float64Expression`
+        Estimated individual-specific allele frequency.
+    maf : :obj:`float`
+        Minimum individual-specific minor allele frequency.
+
+    Returns
+    -------
+    :class:`.BooleanExpression`
+        ``True`` if `mu` is not valid for relatedness estimation, else ``False``.
+    """
     return (mu <= maf) | (mu >= (1.0 - maf)) | (mu <= 0.0) | (mu >= 1.0)
 
 
-def _bad_gt(gt):
+def _bad_gt(gt: Float64Expression) -> BooleanExpression:
+    """Check if genotype value is not valid.
+
+    Parameters
+    ----------
+    gt : :class:`.Float64Expression`
+        Allele count.
+
+    Returns
+    -------
+    :class:`.BooleanExpression`
+        ``True`` if `gt` is not 0, 1, or 2. Else ``False``.
+    """
     return (gt != 0.0) & (gt != 1.0) & (gt != 2.0)
 
 
-def _gram(M):
+def _gram(M: BlockMatrix) -> BlockMatrix:
+    """Compute Gram matrix, `M.T @ M`.
+
+    Parameters
+    ----------
+    M : :class:`.BlockMatrix`
+
+    Returns
+    -------
+    :class:`.BlockMatrix`
+        `M.T @ M`
+    """
     return M.T @ M
 
 
-def _AtB_plus_BtA(A, B):
+def _AtB_plus_BtA(A: BlockMatrix, B: BlockMatrix) -> BlockMatrix:
+    """Compute `(A.T @ B) + (B.T @ A)`, used in estimating IBD0 (k0).
+
+    Parameters
+    ----------
+    A : :class:`.BlockMatrix`
+    B : :class:`.BlockMatrix`
+
+    Returns
+    -------
+    :class:`.BlockMatrix`
+        `(A.T @ B) + (B.T @ A)`
+    """
     temp = (A.T @ B).persist()
     return temp + temp.T
 
@@ -34,9 +87,15 @@ def _AtB_plus_BtA(A, B):
            statistics=enumeration('kin', 'kin2', 'kin20', 'all'),
            block_size=nullable(int),
            include_self_kinship=bool)
-def pc_relate_2(call_expr, min_individual_maf, *, k=None, scores_expr=None,
-                min_kinship=None, statistics="all", block_size=None,
-                include_self_kinship=False) -> Table:
+def pc_relate_2(call_expr: CallExpression,
+                min_individual_maf: float,
+                *,
+                k: Optional[int] = None,
+                scores_expr: Optional[ArrayNumericExpression] = None,
+                min_kinship: Optional[float] = None,
+                statistics: str = "all",
+                block_size: Optional[int] = None,
+                include_self_kinship: bool = False) -> Table:
     r"""Compute relatedness estimates between individuals using a variant of the
     PC-Relate method.
 
@@ -315,9 +374,11 @@ def pc_relate_2(call_expr, min_individual_maf, *, k=None, scores_expr=None,
     elif not k and scores_expr is not None:
         analyze('pc_relate_2/scores_expr', scores_expr, mt._col_indices)
     elif k and scores_expr is not None:
-        raise ValueError("pc_relate_2: exactly one of 'k' and 'scores_expr' must be set, found both")
+        raise ValueError("pc_relate_2: exactly one of 'k' and 'scores_expr' "
+                         "must be set, found both")
     else:
-        raise ValueError("pc_relate_2: exactly one of 'k' and 'scores_expr' must be set, found neither")
+        raise ValueError("pc_relate_2: exactly one of 'k' and 'scores_expr' "
+                         "must be set, found neither")
 
     scores_table = mt.select_cols(__scores=scores_expr) \
         .key_cols_by().select_cols('__scores').cols()
