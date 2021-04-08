@@ -8,6 +8,7 @@ from hail.expr import (ArrayNumericExpression, BooleanExpression,
 from hail.linalg import BlockMatrix
 from hail.table import Table
 from hail.typecheck import enumeration, nullable, numeric, typecheck
+from hail.utils import new_temp_file
 
 from ..pca import hwe_normalized_pca
 
@@ -394,7 +395,7 @@ def pc_relate_2(call_expr: CallExpression,
     if not block_size:
         block_size = BlockMatrix.default_block_size()
 
-    g_bm = BlockMatrix.from_entry_expr(mean_imputed_gt, block_size=block_size).persist()
+    g_bm = BlockMatrix.from_entry_expr(mean_imputed_gt, block_size=block_size)
 
     pcs = hl.nd.array(scores_table.collect(_localize=False).map(lambda x: x.__scores))
 
@@ -403,10 +404,11 @@ def pc_relate_2(call_expr: CallExpression,
     q, r = hl.nd.qr(v, mode='reduced')
 
     # Compute beta and mu
-    rinv_qt_bm = BlockMatrix.from_numpy(hl.eval(hl.nd.inv(r) @ q.T), block_size=block_size).persist()
-    beta_bm = (rinv_qt_bm @ g_bm.T).persist()
+    rinv_qt_bm = BlockMatrix.from_numpy(hl.eval(hl.nd.inv(r) @ q.T), block_size=block_size). \
+        checkpoint(new_temp_file("pcrelate2/rinv_qt", ".bm"))
+    beta_bm = (rinv_qt_bm @ g_bm.T).checkpoint(new_temp_file("pcrelate2/beta", ".bm"))
     v_bm = BlockMatrix.from_numpy(hl.eval(v), block_size=block_size)
-    mu_bm = (0.5 * (v_bm @ beta_bm).T)
+    mu_bm = (0.5 * (v_bm @ beta_bm).T).checkpoint(new_temp_file("pcrelate2/mu", ".bm"))
 
     # Define NaN to use instead of missing, otherwise cannot go back to block matrix
     nan = hl.literal(0) / 0
@@ -443,7 +445,7 @@ def pc_relate_2(call_expr: CallExpression,
     # Compute kinship (phi) estimate
     centered_af_bm = BlockMatrix.from_entry_expr(bm_mt.centered_af, block_size=block_size)
     std_dev_bm = BlockMatrix.from_entry_expr(bm_mt.std_dev, block_size=block_size)
-    phi_bm = (_gram(centered_af_bm) / _gram(std_dev_bm)).persist()
+    phi_bm = (_gram(centered_af_bm) / _gram(std_dev_bm)).checkpoint(new_temp_file("pcrelate2/phi", ".bm"))
     ht = phi_bm.entries().rename({'entry': 'kin'})
     ht = ht.annotate(k0=hl.missing(hl.tfloat64),
                      k1=hl.missing(hl.tfloat64),
@@ -470,7 +472,8 @@ def pc_relate_2(call_expr: CallExpression,
         # Compute IBD2 (k2) estimate
         normalized_gd_bm = BlockMatrix.from_entry_expr(bm_mt.normalized_gd, block_size=block_size)
         variance_bm = BlockMatrix.from_entry_expr(bm_mt.variance, block_size=block_size)
-        k2_bm = _gram(normalized_gd_bm) / _gram(variance_bm)
+        k2_bm = (_gram(normalized_gd_bm) / _gram(variance_bm)) \
+            .checkpoint(new_temp_file("pcrelate2/k2", ".bm"))
         ht = ht.annotate(k2=k2_bm.entries()[ht.i, ht.j].entry)
 
         if statistics is "kin20" or "all":
@@ -490,7 +493,8 @@ def pc_relate_2(call_expr: CallExpression,
             # Compute IBD0 (k0) estimates for when phi > _k0_cutoff
             mu2_bm = BlockMatrix.from_entry_expr(bm_mt.mu2, block_size=block_size)
             one_minus_mu2_bm = BlockMatrix.from_entry_expr(bm_mt.one_minus_mu2, block_size=block_size)
-            k0_bm = ibs0_bm / _AtB_plus_BtA(mu2_bm, one_minus_mu2_bm)
+            k0_bm = (ibs0_bm / _AtB_plus_BtA(mu2_bm, one_minus_mu2_bm)) \
+                .checkpoint(new_temp_file("pcrelate2/k0", ".bm"))
             ht = ht.annotate(k0=k0_bm.entries()[ht.i, ht.j].entry)
 
             # Correct the IBD0 (k0) estimates for when phi <= _k0_cutoff
