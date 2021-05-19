@@ -420,6 +420,42 @@
       }
     ]
   },
+  "GTEx_eQTL_all_snp_gene_associations": {
+    "annotation_db": {
+      "key_properties": []
+    },
+    "description": " ",
+    "url": "https://gtexportal.org/home/datasets",
+    "versions": [
+      {
+        "reference_genome": "GRCh38",
+        "url": {
+          "gcp": {
+            "us": "gs://hail-datasets-us/GTEx_eQTL_all_snp_gene_associations_v8_GRCh38.mt"
+          }
+        },
+        "version": "v8"
+      }
+    ]
+  },
+  "GTEx_sQTL_all_snp_gene_associations": {
+    "annotation_db": {
+      "key_properties": []
+    },
+    "description": " ",
+    "url": "https://gtexportal.org/home/datasets",
+    "versions": [
+      {
+        "reference_genome": "GRCh38",
+        "url": {
+          "gcp": {
+            "us": "gs://hail-datasets-us/GTEx_sQTL_all_snp_gene_associations_v8_GRCh38.mt"
+          }
+        },
+        "version": "v8"
+      }
+    ]
+  },
   "GTEx_eQTL_allpairs_Adipose_Subcutaneous": {
     "annotation_db": {
       "key_properties": []

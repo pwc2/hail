@@ -152,8 +152,16 @@ class DatasetVersion:
         :class:`StructExpression`, optional
             Struct of compatible indexed values, if they exist.
         """
-        return hl.read_table(self.url)._maybe_flexindex_table_by_expr(
-            indexer_key_expr, all_matches=all_matches)
+        if self.url.endswith(".ht"):
+            ht = hl.read_table(self.url)
+            return ht._maybe_flexindex_table_by_expr(
+                    indexer_key_expr,  all_matches=all_matches
+            )
+        else:
+            mt = hl.read_matrix_table(self.url)
+            return mt._localize_entries("entries", "columns")._maybe_flexindex_table_by_expr(
+                    indexer_key_expr, all_matches=all_matches
+            )
 
 
 class Dataset:
