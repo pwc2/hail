@@ -131,9 +131,10 @@ class DatasetVersion:
             warnings.warn(message, UserWarning, stacklevel=1)
         return valid_region
 
-    def maybe_index(self,
-                    indexer_key_expr: StructExpression,
-                    all_matches: bool) -> Optional[StructExpression]:
+    def maybe_index(
+            self,
+            indexer_key_expr: StructExpression,
+            all_matches: bool) -> tuple[str, Optional[StructExpression]]:
         """Find the prefix of the given indexer expression that can index the
         :class:`.DatasetVersion`, if it exists.
 
@@ -149,19 +150,25 @@ class DatasetVersion:
 
         Returns
         -------
-        :class:`StructExpression`, optional
-            Struct of compatible indexed values, if they exist.
+        :obj:`tuple`
+            Tuple of `(ht_or_mt, index)` where `ht_or_mt` is string that
+            indicates if annotation dataset is a Table or MatrixTable, and
+            `index` is a struct of compatible indexed values, if they exist.
         """
-        if self.url.endswith(".ht"):
+        if self.url.endswith('.ht'):
             ht = hl.read_table(self.url)
-            return ht._maybe_flexindex_table_by_expr(
-                    indexer_key_expr,  all_matches=all_matches
-            )
+            ht_or_mt = 'ht'
         else:
             mt = hl.read_matrix_table(self.url)
-            return mt._localize_entries("entries", "columns")._maybe_flexindex_table_by_expr(
-                    indexer_key_expr, all_matches=all_matches
+            ht = mt._localize_entries('entries', 'columns__')
+            cols_array = ht.columns__.map(lambda x: x[0])
+            ht = ht.annotate(
+                # entries=hl.zip(ht.columns__, ht.entries__).map(lambda x: x[0].annotate(**x[1])),
+                entries_array_index=hl.dict(hl.enumerate(cols_array).map(lambda x: (x[1], x[0])))
             )
+            ht_or_mt = 'mt'
+        index = ht._maybe_flexindex_table_by_expr(indexer_key_expr, all_matches=all_matches)
+        return ht_or_mt, index
 
 
 class Dataset:
@@ -253,7 +260,7 @@ class Dataset:
         return 'gene' in self.key_properties
 
     def index_compatible_version(self,
-                                 key_expr: StructExpression) -> StructExpression:
+                                 key_expr: StructExpression) -> tuple[str, StructExpression]:
         """Get index from compatible version of annotation dataset.
 
         Checks for compatible indexed values from each :class:`.DatasetVersion`
@@ -272,10 +279,11 @@ class Dataset:
         """
         all_matches = 'unique' not in self.key_properties
         compatible_indexed_values = [
-            index
-            for index in (version.maybe_index(key_expr, all_matches)
-                          for version in self.versions)
-            if index is not None]
+            (ht_or_mt, index)
+            for ht_or_mt, index in (version.maybe_index(key_expr, all_matches)
+                                    for version in self.versions)
+            if index is not None
+        ]
         if len(compatible_indexed_values) == 0:
             versions = [f'{(v.version, v.reference_genome)}' for v in self.versions]
             raise ValueError(
@@ -430,8 +438,7 @@ class DB:
         return self.__by_name[name]
 
     def _annotate_gene_name(self,
-                            rel: Union[TableRows, MatrixRows]
-                            ) -> Tuple[str, Union[TableRows, MatrixRows]]:
+                            rel: Union[TableRows, MatrixRows]) -> Tuple[str, Union[TableRows, MatrixRows]]:
         """Annotate row lens with gene name if annotation dataset is gene
         keyed.
 
@@ -526,20 +533,34 @@ class DB:
         for dataset in datasets:
             if dataset.is_gene_keyed:
                 genes = rel.select(gene_field).explode(gene_field)
-                genes = genes.annotate(**{
-                    dataset.name: dataset.index_compatible_version(genes[gene_field])})
+                ht_or_mt, indexed_value = dataset.index_compatible_version(genes[gene_field])
+                genes = genes.annotate(**{dataset.name: indexed_value})
                 genes = genes.group_by(*genes.key)\
-                             .aggregate(**{
-                                 dataset.name: hl.dict(
-                                     hl.agg.filter(hl.is_defined(genes[dataset.name]),
-                                                   hl.agg.collect((genes[gene_field],
-                                                                   genes[dataset.name]))))})
+                    .aggregate(
+                    **{dataset.name: hl.dict(
+                        hl.agg.filter(
+                            hl.is_defined(genes[dataset.name]),
+                            hl.agg.collect((genes[gene_field], genes[dataset.name]))
+                        )
+                    )}
+                )
                 rel = rel.annotate(**{dataset.name: genes.index(rel.key)[dataset.name]})
             else:
-                indexed_value = dataset.index_compatible_version(rel.key)
+                ht_or_mt, indexed_value = dataset.index_compatible_version(rel.key)
                 if isinstance(indexed_value.dtype, hl.tstruct) and len(indexed_value.dtype) == 0:
                     indexed_value = hl.is_defined(indexed_value)
                 rel = rel.annotate(**{dataset.name: indexed_value})
+            if ht_or_mt == 'mt':
+                rel = rel.explode(dataset.name)
+                rel = rel.unlens()
+                index_dict = rel[dataset.name]['entries_array_index'].take(1)
+                assert len(index_dict) == 1
+                rel = rel.annotate_globals(
+                    **{f'{dataset.name}_entries_index': index_dict[0]}
+                )
+                rel = self._row_lens(rel)
+                new_struct = rel[dataset.name].drop('entries_array_index')
+                rel = rel.annotate(**{dataset.name: new_struct})
         if gene_field:
             rel = rel.drop(gene_field)
         return rel.unlens()
