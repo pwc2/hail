@@ -61,15 +61,17 @@ def test_pc_relate_2_simple_example():
 @fails_spark_backend()
 def test_pc_relate_2_paths():
     mt = hl.balding_nichols_model(3, 50, 100)
+    hl.set_global_seed(0)
     _, scores3, _ = hl._hwe_normalized_blanczos(mt.GT, k=3, compute_loadings=False)
 
-    kin1 = hl.pc_relate_2(mt.GT, 0.10, k=2, statistics='kin', block_size=64)
+    hl.set_global_seed(0)
+    kin1 = hl.pc_relate_2(mt.GT, 0.10, k=2, statistics='kin', block_size=64).cache()
     kin2 = hl.pc_relate_2(mt.GT, 0.05, k=2, min_kinship=0.01, statistics='kin2', block_size=128).cache()
     kin3 = hl.pc_relate_2(mt.GT, 0.02, k=3, min_kinship=0.1, statistics='kin20', block_size=64).cache()
     kin_s1 = hl.pc_relate_2(mt.GT, 0.10, scores_expr=scores3[mt.col_key].scores[:2],
-                            statistics='kin', block_size=32)
+                            statistics='kin', block_size=64).cache()
 
-    assert kin1._same(kin_s1, tolerance=1e-4)
+    assert kin1._same(kin_s1, tolerance=2.5e-2, absolute=True)
 
     assert kin1.count() == 50 * 49 / 2
 
@@ -101,10 +103,12 @@ def test_self_kinship():
 
 
 @fails_spark_backend()
-def test_pcrelate_issue_5263():
+def test_pc_relate_issue_5263():
     mt = hl.balding_nichols_model(3, 50, 100)
+    hl.set_global_seed(1)
     expected = hl.pc_relate_2(mt.GT, 0.10, k=2, statistics='all')
     mt = mt.select_entries(GT2=mt.GT,
                            GT=hl.call(hl.rand_bool(0.5), hl.rand_bool(0.5)))
+    hl.set_global_seed(1)
     actual = hl.pc_relate_2(mt.GT2, 0.10, k=2, statistics='all')
     assert expected._same(actual, tolerance=1e-4)
